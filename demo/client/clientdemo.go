@@ -1,9 +1,11 @@
 package main
 
 import (
+	"bytes"
 	"flag"
 	"fmt"
 	"log"
+	"net/rpc"
 
 	"github.com/aws/aws-sdk-go/service/lambda"
 	"github.com/cloudinterfaces/lrpc/client"
@@ -17,11 +19,15 @@ func main() {
 		log.Println("Function name required as first argument")
 		log.Fatal("demo funcName")
 	}
-	c, err := client.Default(funcName)
+	codec, err := client.DefaultCodec(funcName)
 	if err != nil {
 		log.Printf("AWS_REGION may need to be set to use function name: %s", funcName)
 		log.Fatal(err)
 	}
+	buf := new(bytes.Buffer)
+	logger := log.New(buf, "", 0)
+	client.SetLogger(codec, logger.Printf)
+	c := rpc.NewClientWithCodec(codec)
 	var out string
 	quot := demo.Quotient{}
 	args := demo.Args{A: 5, B: 2}
@@ -36,19 +42,11 @@ func main() {
 	log.Println(out)
 	log.Println("Calling Arith.Panic")
 	if err = c.Call("Arith.Panic", &out, &out); err != nil {
-		if client.IsServerPanic(err) {
-			log.Println("Expected panic: ", err)
-		} else {
-			log.Fatal("Not a panic: ", err)
-		}
+		log.Println("Expected panic: ", err)
 	}
 	log.Println("Calling Arith.Error")
 	if err = c.Call("Arith.Error", &out, &out); err != nil {
-		if client.IsMethodErr(err) {
-			log.Println("Expected err:", err)
-		} else {
-			log.Fatal("Unexpected err:", err)
-		}
+		log.Println("Expected err: ", err)
 	}
 	log.Println("Calling Arith.BadIdea")
 	if err = c.Call("Arith.BadIdea", new(struct{}), &out); err != nil {
@@ -56,7 +54,7 @@ func main() {
 	}
 	log.Printf("Request ID was: %s", out)
 	log.Println("Calling Arith.Divide via JSON-RPC", args)
-	if lam := c.(interface {
+	if lam := codec.(interface {
 		Lambda() *lambda.Lambda
 	}); lam != nil {
 		l := lam.Lambda()
@@ -73,5 +71,6 @@ func main() {
 		}
 		log.Printf("Output: %s", string(res.Payload))
 	}
-
+	log.Println("Cloudwatch logs: ")
+	fmt.Println(buf.String())
 }

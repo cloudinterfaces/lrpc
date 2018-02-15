@@ -44,15 +44,19 @@ with a message and the "result" field will be null. All marshalling
 and unmarshalling is by the json package's conventions.
 
 ## Notes
-Lots of things can break between your client and decoding Lambda
-output. The IsMethodErr function is useful to determine
-if any error returned was from the rpc method
-invoked or elsewhere. There is no notion of rpc "sessions"
-or stateful connections in the Lambda environment, therefore
-the gating net/rpc imposes is irrelevant. 
 The Lambda environment must be considered stateless
 (unless you're aware of how it isn't and design your
-net/rpc service accordingly).
+net/rpc service accordingly). If a server cannot decode
+a request (which should be impossible), an out-of-band error occurs.
+In-band errors use a unique convention: errors returned
+by a method invocation append a newline followed by
+the request ID, errors and panics that occur before
+or after a method invocation append a tab character followed
+by the request ID. The intent is not nessisarily for
+clients to inspect returned delimiters but provide
+additional information in a unique way when read by a human. Errors
+returned by the client (in general due to invalid invocation)
+are unadorned.
 
 ## Related
 The [lh](https://github.com/cloudinterfaces/lh) package makes it easy to serve (many or most) http.Handlers with the AWS Lambda Go runtime.

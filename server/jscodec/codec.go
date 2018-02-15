@@ -2,6 +2,7 @@ package jscodec
 
 import (
 	"encoding/json"
+	"fmt"
 	"log"
 	"net/rpc"
 	"sync/atomic"
@@ -16,10 +17,15 @@ type JSResponse struct {
 }
 
 type JSRequest struct {
-	Method string          `json:"method"`
-	Params json.RawMessage `json:"params"`
-	ID     json.RawMessage `json:"id"`
-	out    []byte
+	requestid string
+	Method    string          `json:"method"`
+	Params    json.RawMessage `json:"params"`
+	ID        json.RawMessage `json:"id"`
+	out       []byte
+}
+
+func (j *JSRequest) RequestID(id string) {
+	j.requestid = id
 }
 
 func (j *JSRequest) Output() []byte {
@@ -41,14 +47,14 @@ func (j *JSRequest) ReadRequestBody(i interface{}) error {
 }
 
 func (j *JSRequest) WriteResponse(res *rpc.Response, i interface{}) error {
-	if len(j.ID) == 0 {
+	if len(j.ID) == 0 || string(j.ID) == `null` {
 		return nil
 	}
 	r := JSResponse{
 		ID: j.ID,
 	}
 	if len(res.Error) > 0 {
-		r.Error = res.Error
+		r.Error = fmt.Sprintf("%s\n%s", res.Error, j.requestid)
 		o, err := json.Marshal(r)
 		j.out = o
 		return err

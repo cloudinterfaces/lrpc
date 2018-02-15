@@ -1,31 +1,26 @@
-// Package client provides a net/rpc client for AWS Lambda servers.
-/*
-This package is used to call net/rpc servers depolyed to Lambda
-with the lrpc/server package. It uses the AWS REST API as the transport.
-A two-stage codec is used for call arguments: they are encoded
-to a buffer with gob, then the buffer is marshalled to JSON.
-This prevents poor type conversions.
-
-In some cases it is nessisary to determine if an error was returned
-by the rpc method, the server package, the client, or Lambda itself. Functions
-are provided to facilitate this.
-*/
 package client
 
 import (
+	"bufio"
 	"bytes"
+	"encoding/base64"
 	"encoding/gob"
 	"encoding/json"
+	"fmt"
 	"net/rpc"
 	"os"
 	"strings"
-	"sync/atomic"
 
 	"github.com/aws/aws-sdk-go/aws"
 	"github.com/aws/aws-sdk-go/aws/session"
 	"github.com/aws/aws-sdk-go/service/lambda"
-	"github.com/cloudinterfaces/lrpc"
 )
+
+var tail = new(string)
+
+func init() {
+	*tail = `Tail`
+}
 
 func defaultregion() *string {
 	var defaultregion = "us-east-1"
@@ -35,169 +30,143 @@ func defaultregion() *string {
 	return &defaultregion
 }
 
-// Error is an error
-// associated with the client.
-type Error string
-
-// Error implements error.
-func (c Error) Error() string {
-	return string(c)
+type FunctionError struct {
+	ErrorMessage string
+	ErrorType    string
 }
 
-// IsClientError returns true
-// if err is a ClientError.
-// This indicates a problem with
-// the call, Lambda itself
-// or a bug in the client.
-func IsClientError(err error) bool {
-	switch err.(type) {
-	case Error:
-		return true
+type response struct {
+	req *rpc.Request
+	out *lambda.InvokeOutput
+	err error
+}
+
+type clientcodec struct {
+	svc    *lambda.Lambda
+	name   *string
+	qual   *string
+	c      chan response
+	dec    *gob.Decoder
+	logger func(string, ...interface{})
+}
+
+// SetLogger enables logging of CloudWatch invocation
+// log tails with logger. If logger is nil, disables
+// logging.
+func SetLogger(codec rpc.ClientCodec, logger func(string, ...interface{})) error {
+	if codec == nil {
+		return fmt.Errorf("SetLogger: codec must not be nil")
 	}
-	return false
-}
-
-// IsMethodErr returns true if
-// err was returned by an rpc method.
-// This is expected to be true for
-// most errors returned.
-func IsMethodErr(err error) bool {
-	switch err.(type) {
-	case lrpc.MethodError:
-		return true
+	c, ok := codec.(*clientcodec)
+	if !ok {
+		return fmt.Errorf("SetLogger: codec is not from this package")
 	}
-	return false
+	c.logger = logger
+	return nil
 }
 
-// IsServerPanic returns true if
-// err represents a recovered server panic.
-// This usually indicates a defect with
-// the net/rpc server.
-func IsServerPanic(err error) bool {
-	if e, ok := err.(lrpc.LambdaError); ok {
-		return e.ErrorType == "panic"
-	}
-	return false
-}
-
-// IsServerError returns true if
-// err represents a server error.
-// This usually indicates a defect
-// with a net/rpc call.
-func IsServerError(err error) bool {
-	if e, ok := err.(lrpc.LambdaError); ok {
-		return e.ErrorType == "error"
-	}
-	return false
-}
-
-func wrap(err error) error {
-	if err == nil {
-		return nil
-	}
-	return Error(err.Error())
-}
-
-// Interface is the client Interface.
-type Interface interface {
-	// Call invokes Invoke, discarding the request ID.
-	Call(serviceMethod string, args interface{}, reply interface{}) error
-	// Invoke dispatches a net/rpc call to serviceMethod via the AWS
-	// REST API.
-	Invoke(serviceMethod string, args interface{}, reply interface{}) (requestid *string, err error)
-}
-
-type client struct {
-	name    string
-	qual    *string
-	svc     *lambda.Lambda
-	counter *uint64
-}
-
-func (c *client) Lambda() *lambda.Lambda {
+func (c *clientcodec) Lambda() *lambda.Lambda {
 	return c.svc
 }
 
-func (c *client) Call(serviceMethod string, args interface{}, reply interface{}) error {
-	_, err := c.Invoke(serviceMethod, args, reply)
-	return err
+func (c *clientcodec) ReadResponseHeader(res *rpc.Response) error {
+	r := <-c.c
+	if r.err != nil {
+		res.Error = r.err.Error()
+		res.Seq = r.req.Seq
+		res.ServiceMethod = r.req.ServiceMethod
+		return nil
+	}
+	if c.logger != nil && r.out.LogResult != nil {
+		b, err := base64.StdEncoding.DecodeString(*r.out.LogResult)
+		if err == nil {
+			scanner := bufio.NewScanner(bytes.NewReader(b))
+			for scanner.Scan() {
+				c.logger("%s %v: %s", r.req.ServiceMethod, r.req.Seq, scanner.Text())
+			}
+		}
+	}
+	if r.out.FunctionError != nil {
+		fe := FunctionError{}
+		if err := json.Unmarshal(r.out.Payload, &fe); err != nil {
+			return err
+		}
+		res.Error = fe.ErrorMessage
+		res.Seq = r.req.Seq
+		res.ServiceMethod = r.req.ServiceMethod
+		return nil
+	}
+	dec := gob.NewDecoder(bytes.NewReader(r.out.Payload))
+	err := dec.Decode(res)
+	if err != nil {
+		return err
+	}
+	c.dec = dec
+	return nil
 }
 
-func (c *client) Invoke(serviceMethod string, args interface{}, reply interface{}) (*string, error) {
-	req := rpc.Request{ServiceMethod: serviceMethod, Seq: atomic.AddUint64(c.counter, 1)}
+func (c *clientcodec) ReadResponseBody(i interface{}) error {
+	if i == nil {
+		c.dec = nil
+		return nil
+	}
+	return c.dec.Decode(i)
+}
+
+func (c *clientcodec) Close() error {
+	return nil
+}
+
+func (c *clientcodec) invoke(req *rpc.Request, ir *lambda.InvokeInput) {
+	res, err := c.svc.Invoke(ir)
+	c.c <- response{req: req, out: res, err: err}
+}
+
+func (c *clientcodec) WriteRequest(req *rpc.Request, i interface{}) error {
 	buf := new(bytes.Buffer)
 	encode := gob.NewEncoder(buf).Encode
 	err := encode(req)
 	if err != nil {
-		return nil, wrap(err)
+		return err
 	}
-	if err = encode(args); err != nil {
-		return nil, wrap(err)
+	if err = encode(i); err != nil {
+		return err
 	}
-	input := &lambda.InvokeInput{
-		FunctionName: &c.name,
+	payload, err := json.Marshal(buf.Bytes())
+	if err != nil {
+		return err
+	}
+	ir := &lambda.InvokeInput{
+		FunctionName: c.name,
 		Qualifier:    c.qual,
+		Payload:      payload,
 	}
-	input.Payload, err = json.Marshal(buf.Bytes())
-	if err != nil {
-		return nil, wrap(err)
+	if c.logger != nil {
+		ir.LogType = tail
 	}
-	output, err := c.svc.Invoke(input)
-	if err != nil {
-		return nil, wrap(err)
-	}
-	if output.FunctionError != nil {
-		e := lrpc.LambdaError{}
-		err = json.Unmarshal(output.Payload, &e)
-		if err != nil {
-			return nil, wrap(err)
-		}
-		return nil, e
-	}
-	if len(output.Payload) > 0 {
-		decode := gob.NewDecoder(bytes.NewReader(output.Payload)).Decode
-		var requestid string
-		if err = decode(&requestid); err != nil {
-			return nil, wrap(err)
-		}
-		res := rpc.Response{}
-		if err = decode(&res); err != nil {
-			return nil, wrap(err)
-		}
-		if len(res.Error) == 0 {
-			if err = decode(reply); err != nil {
-				return nil, wrap(err)
-			}
-		}
-		if len(res.Error) > 0 {
-			return nil, lrpc.MethodError{
-				Err: res.Error,
-				ID:  lrpc.ID(requestid),
-			}
-		}
-		return &requestid, nil
-	}
-	return nil, Error("No response payload")
+	go c.invoke(req, ir)
+	return nil
 }
 
-// Default returns a client.Interface
-// using the region set in AWS_REGION
-// or "us-east-1" if not set. An
-// error is returned if funcName
-// cannot be verified as a Lambda
-// function in that region.
-func Default(funcName string) (Interface, error) {
+// DefaultCodec calls NewCodec with a default
+// Lambda client in the "us-east-1"
+// region or AWS_REGION if set.
+func DefaultCodec(funcName string) (rpc.ClientCodec, error) {
 	var sess = session.New(&aws.Config{
 		Region: defaultregion(),
 	})
 	svc := lambda.New(sess)
-	return New(svc, funcName)
+	return NewCodec(svc, funcName)
 }
 
-// New returns a client.Interface using
-// svc. If funcName cannot be verified to
-// exist, an error is returned.
-func New(svc *lambda.Lambda, funcName string) (Interface, error) {
+// NewCodec returns an rpc.ClientCodec for Lambda
+// client svc with funcName. The funcName
+// argument may include an alias or version qualifier (for example
+// "Function:1" specifies version 1 of Function).
+func NewCodec(svc *lambda.Lambda, funcName string) (rpc.ClientCodec, error) {
+	if svc == nil {
+		return nil, fmt.Errorf("NewCodec: *lambda.Lambda must not be nil")
+	}
 	var qualifier *string
 	parts := strings.SplitN(funcName, ":", 2)
 	if len(parts) == 2 {
@@ -208,9 +177,12 @@ func New(svc *lambda.Lambda, funcName string) (Interface, error) {
 	if qualifier != nil {
 		req.Qualifier = qualifier
 	}
-	_, err := svc.GetFunction(req)
+	res, err := svc.GetFunction(req)
 	if err != nil {
 		return nil, err
 	}
-	return &client{name: funcName, qual: qualifier, svc: svc, counter: new(uint64)}, nil
+	if s := *res.Configuration.Runtime; s != `go1.x` {
+		return nil, fmt.Errorf("NewCodec: runtime is not go1.x (%s)", s)
+	}
+	return &clientcodec{name: &funcName, qual: qualifier, svc: svc, c: make(chan response, 1024)}, nil
 }

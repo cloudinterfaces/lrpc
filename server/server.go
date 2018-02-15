@@ -32,7 +32,6 @@ import (
 	"net/rpc"
 	"os"
 	"runtime/debug"
-	"strings"
 
 	"github.com/aws/aws-lambda-go/lambda/messages"
 	"github.com/cloudinterfaces/lrpc/internal/mapping"
@@ -86,11 +85,10 @@ func (c *codec) ReadRequestBody(i interface{}) error {
 func (c *codec) WriteResponse(res *rpc.Response, i interface{}) error {
 	c.out = new(bytes.Buffer)
 	enc := gob.NewEncoder(c.out).Encode
-	err := enc(c.ir.RequestId)
-	if err != nil {
-		return fmt.Errorf("error encoding request id: %v", err)
+	if len(res.Error) > 0 {
+		res.Error = fmt.Sprintf("%s\n%s", res.Error, c.ir.RequestId)
 	}
-	err = enc(res)
+	err := enc(res)
 	if err != nil {
 		return fmt.Errorf("error encoding rpc response: %v", err)
 	}
@@ -115,32 +113,32 @@ func (server) Ping(req *messages.PingRequest, response *messages.PingResponse) e
 	return nil
 }
 
-func jserr(req *messages.InvokeRequest, res *messages.InvokeResponse, err error) error {
-	res.Error = &messages.InvokeResponse_Error{
-		Type:    "error",
-		Message: fmt.Sprintf("%s : %s", req.RequestId, err.Error()),
+func jserr(jsreq jscodec.JSRequest, req *messages.InvokeRequest, res *messages.InvokeResponse, err error) error {
+	r := jscodec.JSResponse{
+		Error: fmt.Sprintf("%s\t%s", err.Error(), req.RequestId),
+		ID:    jsreq.ID,
 	}
-	if strings.HasPrefix(err.Error(), "panic: ") {
-		res.Error.Type = "panic"
-	}
-	return nil
+	o, err := json.Marshal(r)
+	res.Payload = o
+	return err
 }
 
 func invokejson(req *messages.InvokeRequest, res *messages.InvokeResponse) error {
-	defer func() {
-		if r := recover(); r != nil {
-			log.Println("panic: ", r)
-			debug.PrintStack()
-			jserr(req, res, fmt.Errorf("panic: %v", r))
-		}
-	}()
 	r := jscodec.JSRequest{}
 	err := json.Unmarshal(req.Payload, &r)
 	if err != nil {
-		return jserr(req, res, err)
+		return err
 	}
+	defer func() {
+		if rec := recover(); rec != nil {
+			log.Println("panic: ", rec)
+			debug.PrintStack()
+			jserr(r, req, res, fmt.Errorf("panic: %v", rec))
+		}
+	}()
+	r.RequestID(req.RequestId)
 	if err = svr.ServeRequest(&r); err != nil {
-		return jserr(req, res, err)
+		return jserr(r, req, res, err)
 	}
 	output := r.Output()
 	if len(output) == 0 {
@@ -150,44 +148,46 @@ func invokejson(req *messages.InvokeRequest, res *messages.InvokeResponse) error
 	return nil
 }
 
-func ire(req *messages.InvokeRequest, res *messages.InvokeResponse, err error) error {
-	res.Error = &messages.InvokeResponse_Error{
-		Message: fmt.Sprintf("%s\n%s", err.Error(), req.RequestId),
-		Type:    "error",
+func ire(rpcreq rpc.Request, req *messages.InvokeRequest, res *messages.InvokeResponse, err error) error {
+	r := rpc.Response{
+		ServiceMethod: rpcreq.ServiceMethod,
+		Seq:           rpcreq.Seq,
+		Error:         fmt.Sprintf("%s\t%s", err.Error(), req.RequestId),
 	}
-	if strings.HasPrefix(err.Error(), "panic: ") {
-		res.Error.Type = "panic"
-	}
-	return nil
+	buf := new(bytes.Buffer)
+	enc := gob.NewEncoder(buf).Encode
+	err = enc(r)
+	res.Payload = buf.Bytes()
+	return err
 }
 
 func (server) Invoke(req *messages.InvokeRequest, res *messages.InvokeResponse) error {
 	if j := bytes.TrimSpace(req.Payload); len(j) > 0 && j[0] == '{' {
 		return invokejson(req, res)
 	}
-	defer func() {
-		if r := recover(); r != nil {
-			log.Println("panic: ", r)
-			debug.PrintStack()
-			ire(req, res, fmt.Errorf("panic: %s", r))
-		}
-	}()
 	var payload []byte
 	err := json.Unmarshal(req.Payload, &payload)
 	if err != nil {
-		return ire(req, res, err)
+		return err
 	}
 	dec := gob.NewDecoder(bytes.NewReader(payload))
 	var r rpc.Request
 	if err := dec.Decode(&r); err != nil {
-		return ire(req, res, err)
+		return err
 	}
+	defer func() {
+		if rec := recover(); rec != nil {
+			log.Println("panic: ", rec)
+			debug.PrintStack()
+			ire(r, req, res, fmt.Errorf("panic: %s", rec))
+		}
+	}()
 	c := &codec{req: r, Decoder: dec, ir: req}
 	if mapping.M != nil {
 		defer mapping.Delete(req)
 	}
 	if err = svr.ServeRequest(c); err != nil {
-		return ire(req, res, err)
+		return ire(r, req, res, err)
 	}
 	res.Payload = c.out.Bytes()
 	return nil
